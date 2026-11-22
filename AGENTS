@@ -1,0 +1,107 @@
+# AGENTS.md — engineering rules for AI agents on low-latency trading systems
+
+Binding for every agent and sub-agent working in this repo. If a request conflicts with these rules, stop and
+say so. The agent files in `.github/agents/` define roles and workflow only; everything about *this domain*
+lives here, in `.ai/review-checklists.md`, and in the specs.
+
+## 1. Priorities
+**Correctness > determinism > latency > everything else.** A fast wrong order is the worst outcome; a halted
+strategy is better than an unsafe one.
+
+## 2. Repo map (this repo — edit this section when reusing these agents elsewhere)
+| What | Where |
+| --- | --- |
+| System | Smart order routing strategies for US rates (net-price sweep; stealth order on BrokerTec, Fenics, Dealerweb) |
+| Production code (hot path) | `src/main/java/com/demo/sor/**` |
+| Specs (approved requirements) | `.ai/specs/<feature>.md`, template `.ai/specs/_TEMPLATE.md` |
+| Task state | `.ai/tasks/<feature>.md`, template `.ai/tasks/_TEMPLATE.md` |
+| Reference models | `src/test/java/**/reference/**` |
+| Worked-example tests (both engines) | `src/test/java/**/examples/**` |
+| Generators / test drivers | `src/test/java/**/harness/**` (e.g. `Scenarios`, `StealthScenarios`, `StealthDriver`) |
+| Equivalence properties | `src/test/java/**/equivalence/**` |
+| Regression tests (append-only) | `src/test/java/**/regression/**` |
+| Allocation tests | `src/test/java/**/perf/**` |
+| Compile only | `mvn -B -q test-compile` |
+| Build + all tests | `mvn -B verify` |
+| One test class | `mvn -B test -Dtest=<ClassName>` |
+| Equivalence only | `mvn -B test -Dtest='*EquivalenceProperties'` |
+| Fixed-point conventions | `Px` (prices 1e-9 per unit, sizes in face amount), `TreasuryPx` (32nds) |
+
+## 3. Non-negotiable invariants
+Never broken, in any component. A change that would break one stops for the human.
+1. **Risk on the way out.** Every new order, replace and quote passes the risk and limit checks. Never weaken,
+   bypass, reorder or feature-flag off a risk check, price band, size limit, throttle, self-match prevention or
+   kill switch. **Cancels and kill-switch actions are never blocked by risk checks or throttles.**
+2. **No overfill.** When sizing an order against a quantity limit (a parent order, a per-venue cap), count what is
+   filled **and** what is still in flight. Never size from filled quantity alone.
+3. **Fail safe on the unexplained.** Input that cannot be reconciled (a fill for an order we don't have, more
+   filled than sent, a price worse than ours) → stop sending, record what really happened, alert. Input that is
+   expected and safely recognisable (a duplicate execution report with a known execution id, a late ack) is
+   handled idempotently, not by halting. The spec says which is which.
+4. **Safe defaults.** Unconfigured, missing or invalid settings mean disabled or rejected, never permissive.
+5. **Determinism.** Same input sequence → identical output. Time from the event or an injected clock, never the
+   wall clock; no unseeded randomness; no hash-order iteration that affects output; no dependence on thread
+   scheduling or leftover state. State rebuildable from the journal or event log.
+6. **Exact numbers.** Prices, sizes and money are fixed-point integers with a documented scale; no `double` or
+   `BigDecimal` in decisions. No intermediate result may overflow: prove it from the spec's input ranges, or use
+   overflow-safe arithmetic (`Math.multiplyExact`, `Math.multiplyHigh`, 128-bit). Every divide states its rounding.
+   Conversions from venue formats are tested exactly at every format.
+7. **Never touch production** configuration, credentials, connectivity, entitlements or limits.
+
+## 4. Default patterns
+Follow these unless the approved spec's Design section documents a reason not to, together with the test that
+proves the alternative safe.
+1. **Hot path** (runs per market-data update, order event, quote or timer tick; if unsure, treat as hot):
+   zero allocation after warm-up — no `new` per event, boxing, varargs, string building, capturing lambdas or
+   method references, streams, `Optional`, iterators, or exceptions for control flow; no locks, blocking calls, I/O,
+   syscalls or allocating logging; pre-sized buffers with a defined overflow outcome; monomorphic call sites,
+   primitive collections, structure-of-arrays, flyweights. Hot-path changes need an allocation test, and a
+   benchmark when latency is in scope.
+2. **Single writer.** Each mutable field has one documented writer thread; hand-offs use explicit ordering
+   (volatile, VarHandle acquire/release, sequence barriers). Intentional multi-writer structures are allowed only
+   with a documented protocol and a concurrency test (e.g. jcstress).
+3. **Market data** — stale, future-dated, crossed, locked, one-sided or empty books are normal inputs with defined
+   behaviour; freshness thresholds state whether "exactly at the limit" is fresh.
+4. **Conventions in the spec** — buy/sell signs, fees vs rebates, ticks, lots and quoting units are stated in the
+   spec, never assumed. Prefer multiplying before dividing in conversions, once overflow is ruled out (invariant 6).
+5. **Property tests** — jqwik reruns the last failing seed first; to pin one, add `seed = "<seed>"` temporarily,
+   never commit it, and capture the shrunk case as a regression test instead.
+
+## 5. Specs, tests and file ownership
+- **Behaviour changes** start from an approved spec (numbered rules, invariants, worked examples).
+  **Everything else** (optimisations, refactors, tooling, tests, docs) starts from an approved scope with
+  acceptance criteria; behaviour must not change. Changes to threading, state ownership, interfaces, hot-path
+  data structures or recovery count as behaviour changes and need the spec's Design section.
+- Who may edit what (paths from the repo map):
+
+| Files | Only this agent may edit | Human approval |
+| --- | --- | --- |
+| Specs | `spec-writer` | Human approves every version in chat |
+| Task state | `dev-orchestrator` | — (records evidence; authorizes nothing) |
+| Production code | `implementer` | Within the approved spec and rule IDs |
+| Reference models | `reference-modeler` | Within the approved spec and rule IDs |
+| Regression tests — new tests | `tester` | Allowed within the approved scope |
+| Regression tests — changing or removing one | nobody, unless the human asks | The human asks explicitly |
+| Other tests and test helpers | `tester` | Within the approved scope |
+| `AGENTS.md`, `.github/agents/**`, `.ai/review-checklists.md`, `.ai/lessons.md` | humans only | — |
+
+- Never delete a test, disable or skip one, lower property `tries`, narrow a generator, or loosen an assertion
+  to get a green build.
+- Agents share one working copy: never edit files or run the build while another agent is doing so.
+- **Agents never commit.** Only read-only git commands (`status`, `diff`, `log`, `show`, `rev-parse`).
+  Never `commit`, `push`, `merge`, `rebase`, `reset`, `stash`, `checkout` or create branches. The human reviews
+  the diff and commits.
+
+## 6. Verdicts and evidence
+- Reviewers return `PASS`, `FAIL` or `INCONCLUSIVE`. Return `INCONCLUSIVE` — never `PASS` — when you could not read
+  something you needed, the spec does not cover the change, or you could not check an assumption that matters.
+- Every finding cites `file:line`, the rule it breaks, and evidence: a concrete counterexample (inputs or event
+  sequence → expected vs actual), or for structural defects the exact construct and the path or interleaving
+  that breaks it. No evidence → a suspicion or a question, not a finding.
+- Every finding is tagged with who fixes it: `(code)`, `(test)`, `(reference)` or `(spec)`. `(spec)` stops for the human.
+
+## 7. Conduct
+- Read `.ai/lessons.md` before testing or reviewing; check every lesson that applies.
+- Never claim something ran or passed unless you ran it and saw the output.
+- If a business rule, venue behaviour or convention is unclear, stop and ask. Do not guess.
+- No secrets, client names, account numbers or real order data in code, tests or chat.
